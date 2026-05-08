@@ -6,22 +6,24 @@ use std::os::fd::RawFd;
 use std::process;
 use std::time::{Duration, Instant};
 
-use mtr_rust::icmp::EchoRequest;
+use mtr_rust::icmp::{
+    DESTINATION_UNREACHABLE_TYPE, ECHO_REPLY_TYPE, EchoRequest, TIME_EXCEEDED_TYPE,
+};
+use mtr_rust::stats::ProbeStatistics;
 
+const DEFAULT_PROBE_COUNT: u16 = 10;
+const MAX_HOPS: u8 = 30;
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     match parse_command(env::args()) {
-        Command::Version => {
-            println!("mtr-rust {VERSION}");
-        }
-        Command::Probe(target) => run_probe(target),
+        Command::Version => println!("mtr-rust {VERSION}"),
+        Command::Trace(config) => run_trace(config),
     }
 }
 
-fn run_probe(target: Ipv4Addr) {
-
+fn run_trace(config: ProbeConfig) {
     let socket_fd = match create_icmp_socket() {
         Ok(socket_fd) => socket_fd,
         Err(error) => {
@@ -30,7 +32,7 @@ fn run_probe(target: Ipv4Addr) {
         }
     };
 
-    let probe_result = send_one_echo_request(socket_fd, target);
+    let trace_result = collect_hop_reports(socket_fd, &config);
 
     let close_result = unsafe { libc::close(socket_fd) };
     if close_result != 0 {
@@ -39,9 +41,235 @@ fn run_probe(target: Ipv4Addr) {
         process::exit(1);
     }
 
-    if let Err(error) = probe_result {
-        eprintln!("{error}");
-        process::exit(1);
+    match trace_result {
+        Ok(reports) => print_hop_table(&reports),
+        Err(error) => {
+            eprintln!("{error}");
+            process::exit(1);
+        }
+    }
+}
+
+fn collect_hop_reports(socket_fd: RawFd, config: &ProbeConfig) -> io::Result<Vec<HopReport>> {
+    let identifier = process::id() as u16;
+    let destination = ipv4_sockaddr(config.target);
+    let mut next_sequence = 1u16;
+    let mut reports = Vec::new();
+
+    for ttl in 1..=MAX_HOPS {
+        set_socket_ttl(socket_fd, ttl)?;
+
+        let mut report = HopReport::new(ttl);
+        let mut reached_target = false;
+
+        for _ in 0..config.count {
+            report.statistics.record_probe_sent();
+
+            let packet = EchoRequest::new(identifier, next_sequence, b"mtr-rust".to_vec()).to_bytes();
+            let started_at = Instant::now();
+
+            send_icmp_echo_request(socket_fd, &destination, &packet, config.target)?;
+
+            if let Some(reply) =
+                receive_matching_reply(socket_fd, identifier, next_sequence, started_at, config.target)?
+            {
+                report.record_reply(reply.source_ip, reply.rtt);
+
+                if reply.icmp_type == ECHO_REPLY_TYPE && reply.source_ip == config.target {
+                    reached_target = true;
+                }
+            }
+
+            next_sequence = next_sequence.wrapping_add(1);
+            if next_sequence == 0 {
+                next_sequence = 1;
+            }
+        }
+
+        reports.push(report);
+
+        if reached_target {
+            break;
+        }
+    }
+
+    Ok(reports)
+}
+
+fn send_icmp_echo_request(
+    socket_fd: RawFd,
+    destination: &libc::sockaddr_in,
+    packet: &[u8],
+    target: Ipv4Addr,
+) -> io::Result<()> {
+    let sent_bytes = unsafe {
+        libc::sendto(
+            socket_fd,
+            packet.as_ptr() as *const libc::c_void,
+            packet.len(),
+            0,
+            destination as *const libc::sockaddr_in as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+
+    if sent_bytes < 0 {
+        return Err(io::Error::other(format!(
+            "Failed to send ICMP Echo Request to {target}: {}",
+            io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
+}
+
+fn receive_matching_reply(
+    socket_fd: RawFd,
+    identifier: u16,
+    sequence_number: u16,
+    started_at: Instant,
+    target: Ipv4Addr,
+) -> io::Result<Option<MatchedReply>> {
+    loop {
+        let elapsed = started_at.elapsed();
+        if elapsed >= RECEIVE_TIMEOUT {
+            return Ok(None);
+        }
+
+        let remaining = RECEIVE_TIMEOUT.saturating_sub(elapsed);
+        set_receive_timeout(socket_fd, remaining)?;
+
+        let mut receive_buffer = [0_u8; 1500];
+        let mut source = zeroed_sockaddr_in();
+        let mut source_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+        let received_bytes = unsafe {
+            libc::recvfrom(
+                socket_fd,
+                receive_buffer.as_mut_ptr() as *mut libc::c_void,
+                receive_buffer.len(),
+                0,
+                &mut source as *mut libc::sockaddr_in as *mut libc::sockaddr,
+                &mut source_len,
+            )
+        };
+
+        if received_bytes < 0 {
+            let error = io::Error::last_os_error();
+            if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
+                return Ok(None);
+            }
+
+            return Err(io::Error::other(format!(
+                "Failed to receive ICMP reply from {target}: {error}"
+            )));
+        }
+
+        let reply = &receive_buffer[..received_bytes as usize];
+        let source_ip = ipv4_from_sockaddr(&source);
+
+        let Some(parsed_reply) = parse_icmp_response(reply, source_ip) else {
+            continue;
+        };
+
+        if parsed_reply.identifier != identifier || parsed_reply.sequence_number != sequence_number {
+            continue;
+        }
+
+        return Ok(Some(MatchedReply {
+            source_ip: parsed_reply.source_ip,
+            icmp_type: parsed_reply.icmp_type,
+            rtt: started_at.elapsed(),
+        }));
+    }
+}
+
+fn parse_icmp_response(packet: &[u8], source_ip: Ipv4Addr) -> Option<ParsedIcmpResponse> {
+    let outer_icmp = icmp_packet(packet)?;
+    let icmp_type = *outer_icmp.first()?;
+
+    match icmp_type {
+        ECHO_REPLY_TYPE => {
+            let (identifier, sequence_number) = icmp_identifier_and_sequence(outer_icmp)?;
+            Some(ParsedIcmpResponse {
+                source_ip,
+                icmp_type,
+                identifier,
+                sequence_number,
+            })
+        }
+        TIME_EXCEEDED_TYPE | DESTINATION_UNREACHABLE_TYPE => {
+            let embedded_packet = outer_icmp.get(8..)?;
+            let embedded_icmp = icmp_packet(embedded_packet)?;
+            let (identifier, sequence_number) = icmp_identifier_and_sequence(embedded_icmp)?;
+
+            Some(ParsedIcmpResponse {
+                source_ip,
+                icmp_type,
+                identifier,
+                sequence_number,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn icmp_packet(packet: &[u8]) -> Option<&[u8]> {
+    let offset = icmp_offset(packet)?;
+    packet.get(offset..)
+}
+
+fn icmp_offset(packet: &[u8]) -> Option<usize> {
+    let first_byte = *packet.first()?;
+    if first_byte >> 4 == 4 {
+        let header_len = usize::from(first_byte & 0x0f) * 4;
+        if packet.len() < header_len {
+            return None;
+        }
+
+        Some(header_len)
+    } else {
+        Some(0)
+    }
+}
+
+fn icmp_identifier_and_sequence(packet: &[u8]) -> Option<(u16, u16)> {
+    if packet.len() < 8 {
+        return None;
+    }
+
+    Some((
+        u16::from_be_bytes([packet[4], packet[5]]),
+        u16::from_be_bytes([packet[6], packet[7]]),
+    ))
+}
+
+fn print_hop_table(reports: &[HopReport]) {
+    println!(
+        "{:<4} {:<15} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>6}",
+        "Hop", "Host", "Loss%", "Sent", "Recv", "Last", "Avg", "Best", "Wrst"
+    );
+
+    for report in reports {
+        println!(
+            "{:<4} {:<15} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>6}",
+            report.ttl,
+            report.host_label(),
+            format!("{:.1}%", report.statistics.loss_percentage()),
+            report.statistics.sent(),
+            report.statistics.received(),
+            format_rtt(report.statistics.last_rtt_ms()),
+            format_rtt(report.statistics.average_rtt_ms()),
+            format_rtt(report.statistics.best_rtt_ms()),
+            format_rtt(report.statistics.worst_rtt_ms()),
+        );
+    }
+}
+
+fn format_rtt(rtt_ms: Option<f64>) -> String {
+    match rtt_ms {
+        Some(value) => format!("{value:.1}"),
+        None => String::from("-"),
     }
 }
 
@@ -53,31 +281,67 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
         print_usage_and_exit(&program_name);
     };
 
-    if args.next().is_some() {
-        print_usage_and_exit(&program_name);
+    if matches!(first_arg.as_str(), "--version" | "-V") {
+        if args.next().is_some() {
+            print_usage_and_exit(&program_name);
+        }
+
+        return Command::Version;
     }
 
-    match first_arg.as_str() {
-        "--version" | "-V" => Command::Version,
-        _ => match first_arg.parse::<Ipv4Addr>() {
-            Ok(target) => Command::Probe(target),
-            Err(error) => {
-                eprintln!("Invalid IPv4 address '{first_arg}': {error}");
-                print_usage_and_exit(&program_name);
+    let target = match first_arg.parse::<Ipv4Addr>() {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!("Invalid IPv4 address '{first_arg}': {error}");
+            print_usage_and_exit(&program_name);
+        }
+    };
+
+    let mut count = DEFAULT_PROBE_COUNT;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--count" => {
+                let Some(value) = args.next() else {
+                    eprintln!("Missing value after --count");
+                    print_usage_and_exit(&program_name);
+                };
+
+                match value.parse::<u16>() {
+                    Ok(parsed_count) if parsed_count > 0 => count = parsed_count,
+                    Ok(_) => {
+                        eprintln!("Probe count must be greater than zero");
+                        print_usage_and_exit(&program_name);
+                    }
+                    Err(error) => {
+                        eprintln!("Invalid probe count '{value}': {error}");
+                        print_usage_and_exit(&program_name);
+                    }
+                }
             }
-        },
+            _ => print_usage_and_exit(&program_name),
+        }
     }
+
+    Command::Trace(ProbeConfig { target, count })
 }
 
 fn print_usage_and_exit(program_name: &str) -> ! {
-    eprintln!("Usage: {program_name} <target-ipv4>");
+    eprintln!("Usage: {program_name} <target-ipv4> [--count <probes>]");
     eprintln!("       {program_name} --version");
     process::exit(1);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Version,
-    Probe(Ipv4Addr),
+    Trace(ProbeConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeConfig {
+    target: Ipv4Addr,
+    count: u16,
 }
 
 fn create_icmp_socket() -> io::Result<RawFd> {
@@ -99,89 +363,6 @@ fn create_icmp_socket() -> io::Result<RawFd> {
     Ok(socket_fd)
 }
 
-fn send_one_echo_request(socket_fd: RawFd, target: Ipv4Addr) -> io::Result<()> {
-    set_receive_timeout(socket_fd, RECEIVE_TIMEOUT)?;
-
-    let identifier = process::id() as u16;
-    let sequence_number = 1;
-    let packet = EchoRequest::new(identifier, sequence_number, b"mtr-rust".to_vec()).to_bytes();
-    let destination = ipv4_sockaddr(target);
-
-    let started_at = Instant::now();
-    let sent_bytes = unsafe {
-        libc::sendto(
-            socket_fd,
-            packet.as_ptr() as *const libc::c_void,
-            packet.len(),
-            0,
-            &destination as *const libc::sockaddr_in as *const libc::sockaddr,
-            mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-
-    if sent_bytes < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to send ICMP Echo Request to {target}: {}", io::Error::last_os_error()),
-        ));
-    }
-
-    let mut receive_buffer = [0_u8; 1500];
-    let mut source = zeroed_sockaddr_in();
-    let mut source_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-
-    let received_bytes = unsafe {
-        libc::recvfrom(
-            socket_fd,
-            receive_buffer.as_mut_ptr() as *mut libc::c_void,
-            receive_buffer.len(),
-            0,
-            &mut source as *mut libc::sockaddr_in as *mut libc::sockaddr,
-            &mut source_len,
-        )
-    };
-
-    if received_bytes < 0 {
-        let error = io::Error::last_os_error();
-        if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("Timed out waiting for an ICMP reply from {target}"),
-            ));
-        }
-
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to receive ICMP reply from {target}: {error}"),
-        ));
-    }
-
-    let source_ip = ipv4_from_sockaddr(&source);
-    let rtt = started_at.elapsed();
-    let reply = &receive_buffer[..received_bytes as usize];
-
-    match extract_icmp_header(reply) {
-        Some(header) => {
-            println!(
-                "Reply from {source_ip}: type={} code={} id={} seq={} time={:.2?}",
-                header.icmp_type,
-                header.code,
-                header.identifier,
-                header.sequence_number,
-                rtt
-            );
-        }
-        None => {
-            println!(
-                "Reply from {source_ip}: received {} bytes in {:.2?}",
-                received_bytes, rtt
-            );
-        }
-    }
-
-    Ok(())
-}
-
 fn set_receive_timeout(socket_fd: RawFd, timeout: Duration) -> io::Result<()> {
     let timeout = libc::timeval {
         tv_sec: timeout.as_secs() as libc::time_t,
@@ -199,10 +380,32 @@ fn set_receive_timeout(socket_fd: RawFd, timeout: Duration) -> io::Result<()> {
     };
 
     if result != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to set receive timeout: {}", io::Error::last_os_error()),
-        ));
+        return Err(io::Error::other(format!(
+            "Failed to set receive timeout: {}",
+            io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
+}
+
+fn set_socket_ttl(socket_fd: RawFd, ttl: u8) -> io::Result<()> {
+    let ttl_value = i32::from(ttl);
+    let result = unsafe {
+        libc::setsockopt(
+            socket_fd,
+            libc::IPPROTO_IP,
+            libc::IP_TTL,
+            &ttl_value as *const libc::c_int as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+
+    if result != 0 {
+        return Err(io::Error::other(format!(
+            "Failed to set TTL to {ttl}: {}",
+            io::Error::last_os_error()
+        )));
     }
 
     Ok(())
@@ -240,56 +443,89 @@ fn ipv4_from_sockaddr(address: &libc::sockaddr_in) -> Ipv4Addr {
     Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr))
 }
 
-fn extract_icmp_header(packet: &[u8]) -> Option<IcmpHeader> {
-    let icmp_offset = if packet.first().is_some_and(|first_byte| first_byte >> 4 == 4) {
-        let header_len = usize::from(packet[0] & 0x0f) * 4;
-        if packet.len() < header_len {
-            return None;
-        }
-        header_len
-    } else {
-        0
-    };
-
-    let icmp_packet = packet.get(icmp_offset..)?;
-    if icmp_packet.len() < 8 {
-        return None;
-    }
-
-    Some(IcmpHeader {
-        icmp_type: icmp_packet[0],
-        code: icmp_packet[1],
-        identifier: u16::from_be_bytes([icmp_packet[4], icmp_packet[5]]),
-        sequence_number: u16::from_be_bytes([icmp_packet[6], icmp_packet[7]]),
-    })
-}
-
-struct IcmpHeader {
+struct ParsedIcmpResponse {
+    source_ip: Ipv4Addr,
     icmp_type: u8,
-    code: u8,
     identifier: u16,
     sequence_number: u16,
 }
 
+struct MatchedReply {
+    source_ip: Ipv4Addr,
+    icmp_type: u8,
+    rtt: Duration,
+}
+
+struct HopReport {
+    ttl: u8,
+    host: Option<Ipv4Addr>,
+    statistics: ProbeStatistics,
+}
+
+impl HopReport {
+    fn new(ttl: u8) -> Self {
+        Self {
+            ttl,
+            host: None,
+            statistics: ProbeStatistics::default(),
+        }
+    }
+
+    fn record_reply(&mut self, source_ip: Ipv4Addr, rtt: Duration) {
+        if self.host.is_none() {
+            self.host = Some(source_ip);
+        }
+
+        self.statistics.record_reply(rtt);
+    }
+
+    fn host_label(&self) -> String {
+        self.host
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| String::from("*"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Command, parse_command};
+    use super::{Command, DEFAULT_PROBE_COUNT, ProbeConfig, parse_command};
     use std::net::Ipv4Addr;
 
     #[test]
     fn parse_command_accepts_version_flag() {
         let command = parse_command([String::from("mtr-rust"), String::from("--version")]);
 
-        assert!(matches!(command, Command::Version));
+        assert_eq!(command, Command::Version);
     }
 
     #[test]
-    fn parse_command_accepts_ipv4_target() {
+    fn parse_command_defaults_probe_count_to_ten() {
         let command = parse_command([String::from("mtr-rust"), String::from("8.8.8.8")]);
 
-        match command {
-            Command::Probe(target) => assert_eq!(target, Ipv4Addr::new(8, 8, 8, 8)),
-            Command::Version => panic!("expected probe command"),
-        }
+        assert_eq!(
+            command,
+            Command::Trace(ProbeConfig {
+                target: Ipv4Addr::new(8, 8, 8, 8),
+                count: DEFAULT_PROBE_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_command_accepts_custom_probe_count() {
+        let command = parse_command([
+            String::from("mtr-rust"),
+            String::from("8.8.8.8"),
+            String::from("--count"),
+            String::from("3"),
+        ]);
+
+        assert_eq!(
+            command,
+            Command::Trace(ProbeConfig {
+                target: Ipv4Addr::new(8, 8, 8, 8),
+                count: 3,
+            })
+        );
     }
 }

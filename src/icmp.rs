@@ -1,5 +1,8 @@
+pub const ECHO_REPLY_TYPE: u8 = 0;
+pub const DESTINATION_UNREACHABLE_TYPE: u8 = 3;
 pub const ECHO_REQUEST_TYPE: u8 = 8;
 pub const ECHO_REQUEST_CODE: u8 = 0;
+pub const TIME_EXCEEDED_TYPE: u8 = 11;
 pub const ICMP_HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
