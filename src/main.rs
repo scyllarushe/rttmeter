@@ -12,8 +12,8 @@ use mtr_rust::icmp::{
 use mtr_rust::stats::ProbeStatistics;
 
 const DEFAULT_PROBE_COUNT: u16 = 10;
-const MAX_HOPS: u8 = 30;
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_TTL: u8 = 30;
+const PER_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
@@ -24,6 +24,14 @@ fn main() {
 }
 
 fn run_trace(config: ProbeConfig) {
+    eprintln!(
+        "Starting mtr-rust target={} count={} max_ttl={} timeout={:.1}s",
+        config.target,
+        config.count,
+        config.max_ttl,
+        PER_PROBE_TIMEOUT.as_secs_f64()
+    );
+
     let socket_fd = match create_icmp_socket() {
         Ok(socket_fd) => socket_fd,
         Err(error) => {
@@ -56,7 +64,7 @@ fn collect_hop_reports(socket_fd: RawFd, config: &ProbeConfig) -> io::Result<Vec
     let mut next_sequence = 1u16;
     let mut reports = Vec::new();
 
-    for ttl in 1..=MAX_HOPS {
+    for ttl in 1..=config.max_ttl {
         set_socket_ttl(socket_fd, ttl)?;
 
         let mut report = HopReport::new(ttl);
@@ -64,6 +72,7 @@ fn collect_hop_reports(socket_fd: RawFd, config: &ProbeConfig) -> io::Result<Vec
 
         for _ in 0..config.count {
             report.statistics.record_probe_sent();
+            eprintln!("Probing ttl={ttl} seq={next_sequence}...");
 
             let packet = EchoRequest::new(identifier, next_sequence, b"mtr-rust".to_vec()).to_bytes();
             let started_at = Instant::now();
@@ -74,10 +83,17 @@ fn collect_hop_reports(socket_fd: RawFd, config: &ProbeConfig) -> io::Result<Vec
                 receive_matching_reply(socket_fd, identifier, next_sequence, started_at, config.target)?
             {
                 report.record_reply(reply.source_ip, reply.rtt);
+                eprintln!(
+                    "Reply ttl={ttl} from {} rtt={}ms",
+                    reply.source_ip,
+                    format_duration_ms(reply.rtt)
+                );
 
                 if reply.icmp_type == ECHO_REPLY_TYPE && reply.source_ip == config.target {
                     reached_target = true;
                 }
+            } else {
+                eprintln!("Timeout ttl={ttl} seq={next_sequence}");
             }
 
             next_sequence = next_sequence.wrapping_add(1);
@@ -132,11 +148,11 @@ fn receive_matching_reply(
 ) -> io::Result<Option<MatchedReply>> {
     loop {
         let elapsed = started_at.elapsed();
-        if elapsed >= RECEIVE_TIMEOUT {
+        if elapsed >= PER_PROBE_TIMEOUT {
             return Ok(None);
         }
 
-        let remaining = RECEIVE_TIMEOUT.saturating_sub(elapsed);
+        let remaining = PER_PROBE_TIMEOUT.saturating_sub(elapsed);
         set_receive_timeout(socket_fd, remaining)?;
 
         let mut receive_buffer = [0_u8; 1500];
@@ -273,6 +289,10 @@ fn format_rtt(rtt_ms: Option<f64>) -> String {
     }
 }
 
+fn format_duration_ms(duration: Duration) -> String {
+    format!("{:.1}", duration.as_secs_f64() * 1000.0)
+}
+
 fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
     let mut args = args.into_iter();
     let program_name = args.next().unwrap_or_else(|| String::from("mtr-rust"));
@@ -298,6 +318,7 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
     };
 
     let mut count = DEFAULT_PROBE_COUNT;
+    let mut max_ttl = DEFAULT_MAX_TTL;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -319,15 +340,37 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
                     }
                 }
             }
+            "--max-ttl" => {
+                let Some(value) = args.next() else {
+                    eprintln!("Missing value after --max-ttl");
+                    print_usage_and_exit(&program_name);
+                };
+
+                match value.parse::<u8>() {
+                    Ok(parsed_max_ttl) if parsed_max_ttl > 0 => max_ttl = parsed_max_ttl,
+                    Ok(_) => {
+                        eprintln!("Max TTL must be greater than zero");
+                        print_usage_and_exit(&program_name);
+                    }
+                    Err(error) => {
+                        eprintln!("Invalid max TTL '{value}': {error}");
+                        print_usage_and_exit(&program_name);
+                    }
+                }
+            }
             _ => print_usage_and_exit(&program_name),
         }
     }
 
-    Command::Trace(ProbeConfig { target, count })
+    Command::Trace(ProbeConfig {
+        target,
+        count,
+        max_ttl,
+    })
 }
 
 fn print_usage_and_exit(program_name: &str) -> ! {
-    eprintln!("Usage: {program_name} <target-ipv4> [--count <probes>]");
+    eprintln!("Usage: {program_name} <target-ipv4> [--count <probes>] [--max-ttl <hops>]");
     eprintln!("       {program_name} --version");
     process::exit(1);
 }
@@ -342,6 +385,7 @@ enum Command {
 struct ProbeConfig {
     target: Ipv4Addr,
     count: u16,
+    max_ttl: u8,
 }
 
 fn create_icmp_socket() -> io::Result<RawFd> {
@@ -488,7 +532,7 @@ impl HopReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, DEFAULT_PROBE_COUNT, ProbeConfig, parse_command};
+    use super::{Command, DEFAULT_MAX_TTL, DEFAULT_PROBE_COUNT, ProbeConfig, parse_command};
     use std::net::Ipv4Addr;
 
     #[test]
@@ -507,17 +551,20 @@ mod tests {
             Command::Trace(ProbeConfig {
                 target: Ipv4Addr::new(8, 8, 8, 8),
                 count: DEFAULT_PROBE_COUNT,
+                max_ttl: DEFAULT_MAX_TTL,
             })
         );
     }
 
     #[test]
-    fn parse_command_accepts_custom_probe_count() {
+    fn parse_command_accepts_custom_probe_count_and_max_ttl() {
         let command = parse_command([
             String::from("mtr-rust"),
             String::from("8.8.8.8"),
             String::from("--count"),
             String::from("3"),
+            String::from("--max-ttl"),
+            String::from("5"),
         ]);
 
         assert_eq!(
@@ -525,6 +572,7 @@ mod tests {
             Command::Trace(ProbeConfig {
                 target: Ipv4Addr::new(8, 8, 8, 8),
                 count: 3,
+                max_ttl: 5,
             })
         );
     }

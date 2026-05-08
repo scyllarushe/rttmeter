@@ -9,6 +9,8 @@ The current step is a small, educational `v0.5`:
 3. Walk TTL values one hop at a time.
 4. Print a simple `mtr`-style summary table with per-hop packet loss and RTT
    statistics.
+5. Print startup and per-probe progress messages so it is clear what the
+   program is doing while it runs.
 
 It is still intentionally limited:
 
@@ -50,9 +52,27 @@ You can choose a different probe count:
 sudo ./target/debug/mtr-rust 8.8.8.8 --count 5
 ```
 
+By default, the program probes up to `30` TTLs. You can lower that while
+experimenting:
+
+```bash
+sudo ./target/debug/mtr-rust 8.8.8.8 --count 5 --max-ttl 5
+```
+
 If socket creation fails, the program prints the operating system error so you
-can see whether it is a permissions issue or something else. If no reply
-arrives before the receive timeout, that probe counts as lost for the hop.
+can see whether it is a permissions issue or something else. Each probe uses a
+`1` second timeout. If no reply arrives before that timeout, the probe counts
+as lost for the hop.
+
+While probing, the program prints progress lines such as:
+
+```text
+Starting mtr-rust target=8.8.8.8 count=5 max_ttl=5 timeout=1.0s
+Probing ttl=1 seq=1...
+Reply ttl=1 from 192.168.1.1 rtt=2.3ms
+Probing ttl=1 seq=2...
+Timeout ttl=1 seq=2
+```
 
 Example output:
 
