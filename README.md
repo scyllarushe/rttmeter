@@ -2,7 +2,7 @@
 
 A learning-focused Rust implementation of `mtr`.
 
-The current step is a small, educational `v0.7`:
+The current step is a small, educational `v0.8`:
 
 1. Build ICMP Echo Request packets in Rust.
 2. Send repeated IPv4 ICMP probes with a raw socket on macOS.
@@ -14,6 +14,8 @@ The current step is a small, educational `v0.7`:
 6. Offer `--verbose` when you want to see each probe, reply, and timeout.
 7. Match ICMP replies more carefully by identifier and sequence number,
    including `Time Exceeded` packets that contain the embedded original probe.
+8. Accept either a hostname or an IPv4 address as the target and resolve
+   hostnames to IPv4 before probing.
 
 It is still intentionally limited:
 
@@ -55,6 +57,12 @@ You can choose a different probe count:
 sudo ./target/debug/mtr-rust 8.8.8.8 --count 5
 ```
 
+Hostnames work too, as long as they resolve to IPv4:
+
+```bash
+sudo ./target/debug/mtr-rust example.com --count 5
+```
+
 By default, the program probes up to `30` TTLs. You can lower that while
 experimenting:
 
@@ -78,7 +86,7 @@ sudo ./target/debug/mtr-rust 8.8.8.8 --count 5 --max-ttl 5 --verbose
 Verbose mode prints progress lines such as:
 
 ```text
-Starting mtr-rust target=8.8.8.8 count=5 max_ttl=5 timeout=1.0s
+Starting mtr-rust target=example.com resolved=93.184.216.34 count=5 max_ttl=5 timeout=1.0s
 Probing ttl=1 seq=1...
 Reply type=11 from 192.168.1.1 ttl=1 seq=1 matched=yes rtt=2.3ms
 Probing ttl=1 seq=2...
@@ -88,7 +96,7 @@ Timeout ttl=1 seq=2
 Example output:
 
 ```text
-Starting mtr-rust target=8.8.8.8 count=10 max_ttl=30 timeout=1.0s
+Starting mtr-rust target=8.8.8.8 resolved=8.8.8.8 count=10 max_ttl=30 timeout=1.0s
 Hop  Host            Loss%  Sent  Recv  Last   Avg   Best   Wrst
 1    192.168.1.1      0.0%    10    10    2.1    2.3    1.8    4.9
 2    10.0.0.1        10.0%    10     9    8.2    9.1    7.8   13.4
@@ -104,6 +112,8 @@ Hop  Host            Loss%  Sent  Recv  Last   Avg   Best   Wrst
 6. `v0.6`: Add quiet default output and opt-in verbose probe logging.
 7. `v0.7`: Make ICMP reply matching more robust and test `Time Exceeded`
    parsing.
-8. Next: Refresh the table continuously instead of printing it once.
-9. Later: Add reverse DNS lookups as an optional display feature.
-10. Later: Grow that into a small, readable `mtr` implementation.
+8. `v0.8`: Resolve hostnames to IPv4 and display both original and resolved
+   targets.
+9. Next: Refresh the table continuously instead of printing it once.
+10. Later: Add reverse DNS lookups as an optional display feature.
+11. Later: Grow that into a small, readable `mtr` implementation.

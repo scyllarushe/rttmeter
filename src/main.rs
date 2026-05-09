@@ -1,7 +1,7 @@
 use std::env;
 use std::io;
 use std::mem;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::os::fd::RawFd;
 use std::process;
 use std::time::{Duration, Instant};
@@ -25,8 +25,9 @@ fn main() {
 
 fn run_trace(config: ProbeConfig) {
     println!(
-        "Starting mtr-rust target={} count={} max_ttl={} timeout={:.1}s",
-        config.target,
+        "Starting mtr-rust target={} resolved={} count={} max_ttl={} timeout={:.1}s",
+        config.original_target,
+        config.resolved_target,
         config.count,
         config.max_ttl,
         PER_PROBE_TIMEOUT.as_secs_f64()
@@ -60,7 +61,7 @@ fn run_trace(config: ProbeConfig) {
 
 fn collect_hop_reports(socket_fd: RawFd, config: &ProbeConfig) -> io::Result<Vec<HopReport>> {
     let identifier = process::id() as u16;
-    let destination = ipv4_sockaddr(config.target);
+    let destination = ipv4_sockaddr(config.resolved_target);
     let mut next_sequence = 1u16;
     let mut reports = Vec::new();
 
@@ -79,7 +80,7 @@ fn collect_hop_reports(socket_fd: RawFd, config: &ProbeConfig) -> io::Result<Vec
             let packet = EchoRequest::new(identifier, next_sequence, b"mtr-rust".to_vec()).to_bytes();
             let started_at = Instant::now();
 
-            send_icmp_echo_request(socket_fd, &destination, &packet, config.target)?;
+            send_icmp_echo_request(socket_fd, &destination, &packet, config.resolved_target)?;
 
             if let Some(reply) =
                 receive_matching_reply(
@@ -88,13 +89,13 @@ fn collect_hop_reports(socket_fd: RawFd, config: &ProbeConfig) -> io::Result<Vec
                     identifier,
                     next_sequence,
                     started_at,
-                    config.target,
+                    config.resolved_target,
                     config.verbose,
                 )?
             {
                 report.record_reply(reply.source_ip, reply.rtt);
 
-                if reply.icmp_type == ECHO_REPLY_TYPE && reply.source_ip == config.target {
+                if reply.icmp_type == ECHO_REPLY_TYPE && reply.source_ip == config.resolved_target {
                     reached_target = true;
                 }
             } else if config.verbose {
@@ -277,11 +278,11 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
         return Command::Version;
     }
 
-    let target = match first_arg.parse::<Ipv4Addr>() {
+    let resolved_target = match resolve_target(&first_arg) {
         Ok(target) => target,
         Err(error) => {
-            eprintln!("Invalid IPv4 address '{first_arg}': {error}");
-            print_usage_and_exit(&program_name);
+            eprintln!("{error}");
+            process::exit(1);
         }
     };
 
@@ -333,7 +334,8 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
     }
 
     Command::Trace(ProbeConfig {
-        target,
+        original_target: first_arg,
+        resolved_target,
         count,
         max_ttl,
         verbose,
@@ -342,10 +344,30 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
 
 fn print_usage_and_exit(program_name: &str) -> ! {
     eprintln!(
-        "Usage: {program_name} <target-ipv4> [--count <probes>] [--max-ttl <hops>] [--verbose]"
+        "Usage: {program_name} <target> [--count <probes>] [--max-ttl <hops>] [--verbose]"
     );
     eprintln!("       {program_name} --version");
     process::exit(1);
+}
+
+fn resolve_target(target: &str) -> io::Result<Ipv4Addr> {
+    if let Ok(ipv4) = target.parse::<Ipv4Addr>() {
+        return Ok(ipv4);
+    }
+
+    let addresses = (target, 0)
+        .to_socket_addrs()
+        .map_err(|error| io::Error::other(format!("Failed to resolve target '{target}': {error}")))?;
+
+    for address in addresses {
+        if let SocketAddr::V4(ipv4_address) = address {
+            return Ok(*ipv4_address.ip());
+        }
+    }
+
+    Err(io::Error::other(format!(
+        "Target '{target}' did not resolve to an IPv4 address"
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,7 +378,8 @@ enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProbeConfig {
-    target: Ipv4Addr,
+    original_target: String,
+    resolved_target: Ipv4Addr,
     count: u16,
     max_ttl: u8,
     verbose: bool,
@@ -516,7 +539,8 @@ mod tests {
         assert_eq!(
             command,
             Command::Trace(ProbeConfig {
-                target: Ipv4Addr::new(8, 8, 8, 8),
+                original_target: String::from("8.8.8.8"),
+                resolved_target: Ipv4Addr::new(8, 8, 8, 8),
                 count: DEFAULT_PROBE_COUNT,
                 max_ttl: DEFAULT_MAX_TTL,
                 verbose: false,
@@ -539,11 +563,28 @@ mod tests {
         assert_eq!(
             command,
             Command::Trace(ProbeConfig {
-                target: Ipv4Addr::new(8, 8, 8, 8),
+                original_target: String::from("8.8.8.8"),
+                resolved_target: Ipv4Addr::new(8, 8, 8, 8),
                 count: 3,
                 max_ttl: 5,
                 verbose: true,
             })
         );
+    }
+
+    #[test]
+    fn parse_command_accepts_hostname_targets() {
+        let command = parse_command([String::from("mtr-rust"), String::from("localhost")]);
+
+        match command {
+            Command::Trace(config) => {
+                assert_eq!(config.original_target, "localhost");
+                assert!(config.resolved_target.is_loopback());
+                assert_eq!(config.count, DEFAULT_PROBE_COUNT);
+                assert_eq!(config.max_ttl, DEFAULT_MAX_TTL);
+                assert!(!config.verbose);
+            }
+            Command::Version => panic!("expected trace command"),
+        }
     }
 }
