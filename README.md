@@ -12,7 +12,7 @@ git clone https://github.com/scyllarushe/rttmeter
 cd rttmeter
 ```
 
-The current step is a small, educational `v0.17`:
+The current step is a small, educational `v0.18`:
 
 1. Build ICMP Echo Request packets in Rust.
 2. Send repeated IPv4 ICMP probes with a raw socket on macOS.
@@ -39,6 +39,7 @@ The current step is a small, educational `v0.17`:
 16. Show auto-TTL discovery progress before switching to monitoring.
 17. Add RTT trend sparklines and simple network mood/status messages.
 18. Add explicit time units to RTT and stability metrics.
+19. Add optional install scripts for release installs and explicit setuid setup.
 
 It is still intentionally limited:
 
@@ -51,6 +52,12 @@ It is still intentionally limited:
 
 ```bash
 cargo build
+```
+
+Release build:
+
+```bash
+cargo build --release
 ```
 
 ## Version
@@ -66,6 +73,68 @@ with `sudo`:
 
 ```bash
 sudo ./target/debug/rttmeter 8.8.8.8
+```
+
+## Install
+
+Normal local development still uses `sudo` when you run the debug binary:
+
+```bash
+sudo ./target/debug/rttmeter 8.8.8.8
+```
+
+If you want a release install in `/usr/local/bin`, use:
+
+```bash
+./install.sh
+```
+
+That builds the release binary and installs:
+
+```text
+/usr/local/bin/rttmeter
+```
+
+By default, `install.sh` installs with normal executable permissions (`755`).
+
+If you explicitly want setuid root so `rttmeter` can open raw sockets without
+prefixing each run with `sudo`, use:
+
+```bash
+./install.sh --suid
+```
+
+Warning: setuid makes the binary run with elevated privileges. Only enable it
+if you understand the security tradeoff and trust the installed binary.
+
+After a setuid install, you can run the installed release binary directly:
+
+```bash
+/usr/local/bin/rttmeter 8.8.8.8
+```
+
+To verify whether setuid is enabled:
+
+```bash
+ls -l /usr/local/bin/rttmeter
+```
+
+If setuid is enabled, the mode will include an `s`, for example:
+
+```text
+-rwsr-xr-x  1 root  wheel  ... /usr/local/bin/rttmeter
+```
+
+To remove setuid but keep the binary installed:
+
+```bash
+sudo chmod 0755 /usr/local/bin/rttmeter
+```
+
+To uninstall the installed binary entirely:
+
+```bash
+./uninstall.sh
 ```
 
 By default, the program sends `1` probe per sweep and keeps running:
@@ -265,5 +334,6 @@ Output styles:
 15. `v0.15`: Show auto-TTL discovery progress before monitoring.
 16. `v0.16`: Add RTT trend sparklines and simple network mood/status messages.
 17. `v0.17`: Add explicit time units to RTT and stability metrics.
-18. Later: Add optional reverse DNS so the path can show names when that helps more than raw IPs.
-19. Later: Keep evolving `rttmeter` into a compact, readable network path monitor you can actually enjoy using.
+18. `v0.18`: Add optional install scripts and explicit setuid setup for release installs.
+19. Later: Add optional reverse DNS so the path can show names when that helps more than raw IPs.
+20. Later: Keep evolving `rttmeter` into a compact, readable network path monitor you can actually enjoy using.
