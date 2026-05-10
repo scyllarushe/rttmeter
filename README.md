@@ -23,6 +23,8 @@ The current step is a small, educational `v0.13`:
 12. Offer `--interval` to control the delay between continuous sweeps.
 13. Make auto target-TTL discovery the default mode, with `--trace` for full
     path probing.
+14. Default to continuous scrolling output, with `--once` and `--live` as
+    explicit runtime overrides.
 
 It is still intentionally limited:
 
@@ -52,7 +54,7 @@ with `sudo`:
 sudo ./target/debug/mtr-rust 8.8.8.8
 ```
 
-By default, the program sends `1` probe:
+By default, the program sends `1` probe per sweep and keeps running:
 
 ```bash
 sudo ./target/debug/mtr-rust 8.8.8.8
@@ -60,6 +62,11 @@ sudo ./target/debug/mtr-rust 8.8.8.8
 
 By default, the program now discovers the TTL where the target responds and
 then probes only that target TTL.
+By default, that run is equivalent to:
+
+```bash
+sudo ./target/debug/mtr-rust 8.8.8.8 --continuous --scroll --count 1 --interval 0.5
+```
 
 You can choose a different probe count:
 
@@ -67,20 +74,31 @@ You can choose a different probe count:
 sudo ./target/debug/mtr-rust 8.8.8.8 --count 5
 ```
 
-If you want it to keep running until you press `Ctrl+C`, use
-`--continuous`:
+`--continuous` is accepted for compatibility, but it is already the default:
 
 ```bash
 sudo ./target/debug/mtr-rust 8.8.8.8 --count 5 --continuous
 ```
 
-In continuous mode, the default output style is a live refreshed table.
+If you want a one-shot run instead, use `--once`:
+
+```bash
+sudo ./target/debug/mtr-rust 8.8.8.8 --once
+```
+
+In continuous mode, the default output style is scrolling output.
 The default interval between sweeps is `0.5` seconds.
 
-If you want the older scrolling behavior instead, add `--scroll`:
+`--scroll` is accepted for compatibility, but it is already the default:
 
 ```bash
 sudo ./target/debug/mtr-rust 8.8.8.8 --count 5 --max-ttl 5 --continuous --scroll
+```
+
+If you want live refresh instead, add `--live`:
+
+```bash
+sudo ./target/debug/mtr-rust 8.8.8.8 --count 5 --continuous --live
 ```
 
 You can change the delay between sweeps with `--interval`:
@@ -95,10 +113,22 @@ If you want to probe only one hop, use `--ttl`:
 sudo ./target/debug/mtr-rust 8.8.8.8 --ttl 12 --count 1 --verbose
 ```
 
+If you want that single-hop probe to run only once, add `--once`:
+
+```bash
+sudo ./target/debug/mtr-rust 8.8.8.8 --ttl 12 --count 1 --verbose --once
+```
+
 If you want the full path, use `--trace`:
 
 ```bash
 sudo ./target/debug/mtr-rust 8.8.8.8 --trace --max-ttl 12
+```
+
+If you want a one-shot full-path run, add `--once`:
+
+```bash
+sudo ./target/debug/mtr-rust 8.8.8.8 --trace --max-ttl 12 --once
 ```
 
 Hostnames work too, as long as they resolve to IPv4:
@@ -124,7 +154,8 @@ is `1`, the default timeout is `1.0` second, and the default interval is
 `0.5` seconds. If no reply arrives before the timeout, the probe counts as
 lost for the hop.
 
-By default, the program prints a startup line and the final table only.
+By default, the program prints a startup line and then keeps appending updated
+tables in scrolling mode.
 
 If you want to watch each probe while learning or debugging, use `--verbose`:
 
@@ -144,7 +175,7 @@ of live refresh so the per-probe logs stay readable.
 Verbose mode prints progress lines such as:
 
 ```text
-Starting mtr-rust target=example.com resolved=93.184.216.34 count=5 timeout=1.0s interval=0.5s mode=auto-ttl
+Starting mtr-rust target=example.com resolved=93.184.216.34 count=5 timeout=1.0s interval=0.5s mode=auto-ttl run=continuous output=scroll
 Probing ttl=1 seq=1...
 Reply type=11 from 192.168.1.1 ttl=1 seq=1 matched=yes rtt=2.3ms
 Probing ttl=1 seq=2...
@@ -154,7 +185,7 @@ Timeout ttl=1 seq=2
 Example output:
 
 ```text
-Starting mtr-rust target=8.8.8.8 resolved=8.8.8.8 count=1 timeout=1.0s interval=0.5s mode=auto-ttl
+Starting mtr-rust target=8.8.8.8 resolved=8.8.8.8 count=1 timeout=1.0s interval=0.5s mode=auto-ttl run=continuous output=scroll
 Hop  Host            Loss%  Sent  Recv  Last   Avg   Best   Wrst
 12   8.8.8.8          0.0%     1     1   34.2   34.2   34.2   34.2
 ```
@@ -162,7 +193,7 @@ Hop  Host            Loss%  Sent  Recv  Last   Avg   Best   Wrst
 Trace mode example:
 
 ```text
-Starting mtr-rust target=8.8.8.8 resolved=8.8.8.8 count=1 max_ttl=30 timeout=1.0s interval=0.5s mode=trace
+Starting mtr-rust target=8.8.8.8 resolved=8.8.8.8 count=1 max_ttl=30 timeout=1.0s interval=0.5s mode=trace run=continuous output=scroll
 Hop  Host            Loss%  Sent  Recv  Last   Avg   Best   Wrst
 1    192.168.1.1      0.0%     1     1    2.1    2.1    2.1    2.1
 2    10.0.0.1        100.0%     1     0      -      -      -      -
@@ -171,14 +202,14 @@ Hop  Host            Loss%  Sent  Recv  Last   Avg   Best   Wrst
 Usage:
 
 ```text
-<target> [--count <probes>] [--max-ttl <hops> | --ttl <hop>] [--trace] [--interval <seconds>] [--verbose] [--continuous] [--scroll]
+<target> [--count <probes>] [--max-ttl <hops> | --ttl <hop>] [--trace] [--interval <seconds>] [--verbose] [--continuous | --once] [--scroll | --live]
 ```
 
 Output styles:
 
-1. Once mode: one final table.
-2. Continuous mode: live refreshed table.
-3. Continuous `--scroll`: append a new table after every sweep.
+1. Default mode: continuous scrolling tables.
+2. `--once`: one final table.
+3. `--continuous --live`: continuous live-refreshed table.
 4. `--verbose`: detailed per-probe logs with scrolling output.
 
 ## Roadmap

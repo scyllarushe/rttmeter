@@ -28,14 +28,16 @@ fn main() {
 
 fn run_trace(config: ProbeConfig) {
     println!(
-        "Starting mtr-rust target={} resolved={} count={}{} timeout={:.1}s interval={:.1}s mode={}",
+        "Starting mtr-rust target={} resolved={} count={}{} timeout={:.1}s interval={:.1}s mode={} run={} output={}",
         config.original_target,
         config.resolved_target,
         config.count,
         startup_scope_display(&config),
         PER_PROBE_TIMEOUT.as_secs_f64(),
         config.interval.as_secs_f64(),
-        mode_name(&config)
+        mode_name(&config),
+        run_mode_name(&config),
+        output_mode_name(&config)
     );
 
     let socket_fd = match create_icmp_socket() {
@@ -401,6 +403,18 @@ fn should_use_live_refresh(config: &ProbeConfig) -> bool {
     config.continuous && !config.scroll && !config.verbose
 }
 
+fn run_mode_name(config: &ProbeConfig) -> &'static str {
+    if config.continuous { "continuous" } else { "once" }
+}
+
+fn output_mode_name(config: &ProbeConfig) -> &'static str {
+    if should_use_live_refresh(config) {
+        "live"
+    } else {
+        "scroll"
+    }
+}
+
 fn startup_scope_display(config: &ProbeConfig) -> String {
     match selected_mode(config) {
         ProbeMode::SingleTtl(ttl) => format!(" ttl={ttl}"),
@@ -455,8 +469,8 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
     let mut ttl = None;
     let mut trace = false;
     let mut verbose = false;
-    let mut continuous = false;
-    let mut scroll = false;
+    let mut continuous = true;
+    let mut scroll = true;
     let mut interval = DEFAULT_INTERVAL;
 
     while let Some(arg) = args.next() {
@@ -519,8 +533,10 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
                 }
             }
             "--trace" => trace = true,
+            "--once" => continuous = false,
             "--verbose" => verbose = true,
             "--continuous" => continuous = true,
+            "--live" => scroll = false,
             "--scroll" => scroll = true,
             "--interval" => {
                 let Some(value) = args.next() else {
@@ -572,7 +588,7 @@ fn parse_command(args: impl IntoIterator<Item = String>) -> Command {
 
 fn print_usage_and_exit(program_name: &str) -> ! {
     eprintln!(
-        "Usage: {program_name} <target> [--count <probes>] [--max-ttl <hops> | --ttl <hop>] [--trace] [--interval <seconds>] [--verbose] [--continuous] [--scroll]"
+        "Usage: {program_name} <target> [--count <probes>] [--max-ttl <hops> | --ttl <hop>] [--trace] [--interval <seconds>] [--verbose] [--continuous | --once] [--scroll | --live]"
     );
     eprintln!("       {program_name} --version");
     process::exit(1);
@@ -775,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_command_defaults_probe_count_to_ten() {
+    fn parse_command_defaults_probe_count_to_one_and_continuous_scroll() {
         let command = parse_command([String::from("mtr-rust"), String::from("8.8.8.8")]);
 
         assert_eq!(
@@ -788,8 +804,8 @@ mod tests {
                 ttl: None,
                 trace: false,
                 verbose: false,
-                continuous: false,
-                scroll: false,
+                continuous: true,
+                scroll: true,
                 interval: DEFAULT_INTERVAL,
             })
         );
@@ -851,8 +867,8 @@ mod tests {
                 ttl: Some(12),
                 trace: false,
                 verbose: true,
-                continuous: false,
-                scroll: false,
+                continuous: true,
+                scroll: true,
                 interval: DEFAULT_INTERVAL,
             })
         );
@@ -869,6 +885,26 @@ mod tests {
 
         match command {
             Command::Trace(config) => assert_eq!(config.interval, Duration::from_secs_f64(0.5)),
+            Command::Version => panic!("expected trace command"),
+        }
+    }
+
+    #[test]
+    fn parse_command_accepts_once_and_live_overrides() {
+        let command = parse_command([
+            String::from("mtr-rust"),
+            String::from("8.8.8.8"),
+            String::from("--once"),
+            String::from("--live"),
+        ]);
+
+        match command {
+            Command::Trace(config) => {
+                assert!(!config.continuous);
+                assert!(!config.scroll);
+                assert_eq!(config.count, DEFAULT_PROBE_COUNT);
+                assert_eq!(config.interval, DEFAULT_INTERVAL);
+            }
             Command::Version => panic!("expected trace command"),
         }
     }
@@ -904,8 +940,8 @@ mod tests {
                 assert_eq!(config.ttl, None);
                 assert!(!config.trace);
                 assert!(!config.verbose);
-                assert!(!config.continuous);
-                assert!(!config.scroll);
+                assert!(config.continuous);
+                assert!(config.scroll);
                 assert_eq!(config.interval, DEFAULT_INTERVAL);
             }
             Command::Version => panic!("expected trace command"),
